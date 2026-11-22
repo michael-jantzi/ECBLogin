@@ -1,9 +1,11 @@
 <#
 .SYNOPSIS
-Opens a local SSH tunnel to the VNC desktop assigned by Pascal.
+Opens the VNC desktop assigned by Pascal in RealVNC Viewer.
 .DESCRIPTION
 Signs in once, obtains the verification code from ECB_Dept_AuthCode in
-%LOCALAPPDATA%\ECB\otp.kdbx, runs vncconnect, and prints the viewer address.
+%LOCALAPPDATA%\ECB\otp.kdbx, and runs vncconnect. Once the SSH tunnel is ready,
+the script opens RealVNC Viewer using the saved connection settings for the
+local address. The default address matches the ECB Computer:5905 connection.
 On first use, enter your passwords at the prompts. A successful SSH login saves
 them in Windows Credential Manager for your Windows account on this computer.
 Later logins use those passwords and get a fresh verification code from KeePassXC.

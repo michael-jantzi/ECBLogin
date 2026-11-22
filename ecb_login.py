@@ -1,4 +1,4 @@
-"""Connect a local VNC viewer to the desktop assigned by Pascal."""
+"""Open the desktop assigned by Pascal in RealVNC Viewer through an SSH tunnel."""
 
 import argparse
 import asyncio
@@ -16,6 +16,7 @@ from ecb_credentials import read_password, save_password
 
 GATEWAY = "pascal.ee.ryerson.ca"
 LOOPBACK = "127.0.0.1"
+DEFAULT_LOCAL_PORT = 5905
 OTP_ENTRY = "ECB_Dept_AuthCode"
 VNC_IDLE_TIMEOUT = 90
 HOST_PROMPT = re.compile(r"^[ \t]*(Password|Verification code):[ \t\r\n]*\Z", re.IGNORECASE | re.MULTILINE)
@@ -269,6 +270,16 @@ async def discover_vnc(connection, department_password=None, get_verification_co
     raise RuntimeError(f"{failure}\n{detail}" if detail else failure)
 
 
+def open_realvnc(local_port):
+    # Match the saved ECB address exactly. For custom ports, :: forces a TCP port even below 100.
+    address = f"{LOOPBACK}:{local_port}" if local_port == DEFAULT_LOCAL_PORT else f"{LOOPBACK}::{local_port}"
+    viewer = Path(os.environ["ProgramFiles"]) / "RealVNC" / "VNC Viewer" / "vncviewer.exe"
+    try:
+        os.startfile(viewer, arguments=f"-useaddressbook {address}")
+    except OSError as exc:
+        print(f"Could not open RealVNC Viewer ({exc}). Enter {address} in your viewer.", file=sys.stderr)
+
+
 async def connect_vnc(username, local_port, password_entry=None, refresh_passwords=False):
     print(f"Connecting to {username}@{GATEWAY} ...", flush=True)
     client = LoginClient(username, password_entry, refresh_passwords)
@@ -294,6 +305,7 @@ async def connect_vnc(username, local_port, password_entry=None, refresh_passwor
             raise RuntimeError(f"Could not listen on {LOOPBACK}:{local_port}. Try another -LocalPort. {exc}") from exc
         async with listener:
             print(f"VNC tunnel ready: {LOOPBACK}:{local_port} -> {host}:{port}", flush=True)
+            open_realvnc(local_port)
             print("Keep this window open while using VNC. Press Ctrl+C to close the tunnel.", flush=True)
             await connection.wait_closed()
             raise RuntimeError("The SSH connection closed. Run Connect-ECB again to reconnect.")
@@ -302,7 +314,7 @@ async def connect_vnc(username, local_port, password_entry=None, refresh_passwor
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--username", default="mtjantzi")
-    parser.add_argument("--local-port", type=int, default=5905)
+    parser.add_argument("--local-port", type=int, default=DEFAULT_LOCAL_PORT)
     parser.add_argument("--password-entry", help="KeePassXC entry containing the department password")
     parser.add_argument("--refresh-passwords", action="store_true", help="replace remembered passwords after login")
     args = parser.parse_args()

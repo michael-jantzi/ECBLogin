@@ -1,12 +1,14 @@
 import asyncio
 import io
+import os
 import unittest
-from contextlib import asynccontextmanager, redirect_stderr, redirect_stdout
-from unittest.mock import AsyncMock, patch
+from contextlib import ExitStack, asynccontextmanager, redirect_stderr, redirect_stdout
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncssh
 
-from ecb_login import discover_vnc
+from ecb_login import connect_vnc, discover_vnc
 
 
 FORWARD = "ssh student@gateway -L 127.0.0.1:5900:cmp10.example:5901\n"
@@ -245,3 +247,52 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(discover_vnc(connection, PASSWORD), 5)
         self.assertEqual(responses, [PASSWORD + "\n"])
         self.assertNotIn(PASSWORD.strip(), str(caught.exception))
+
+
+class ViewerLaunchTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        fixtures = ExitStack()
+        self.addCleanup(fixtures.close)
+        ssh = fixtures.enter_context(patch("ecb_login.asyncssh.connect"))
+        self.connection = ssh.return_value.__aenter__.return_value
+        self.listener = MagicMock()
+        self.connection.forward_local_port = AsyncMock(return_value=self.listener)
+        self.connection.wait_closed = AsyncMock()
+        fixtures.enter_context(patch("ecb_login.discover_vnc", return_value=("assigned.example", 5990)))
+        fixtures.enter_context(patch.dict(os.environ, {"ProgramFiles": "C:/Fixture Programs"}))
+        self.executable = Path("C:/Fixture Programs") / "RealVNC" / "VNC Viewer" / "vncviewer.exe"
+        self.launch = fixtures.enter_context(patch("ecb_login.os.startfile", create=True))
+        self.errors = fixtures.enter_context(redirect_stderr(io.StringIO()))
+        fixtures.enter_context(redirect_stdout(io.StringIO()))
+
+    async def run_until_disconnect(self, local_port):
+        with self.assertRaisesRegex(RuntimeError, "SSH connection closed"):
+            await connect_vnc("fixture", local_port)
+        self.connection.wait_closed.assert_awaited_once()
+
+    async def test_opens_saved_connection_after_local_tunnel_is_ready(self):
+        def check_listener(*args, **kwargs):
+            self.listener.__aenter__.assert_awaited_once()
+            self.listener.__aexit__.assert_not_awaited()
+            self.connection.wait_closed.assert_not_awaited()
+
+        self.launch.side_effect = check_listener
+        await self.run_until_disconnect(5905)
+        self.connection.forward_local_port.assert_awaited_once_with("127.0.0.1", 5905, "assigned.example", 5990)
+        self.launch.assert_called_once_with(self.executable, arguments="-useaddressbook 127.0.0.1:5905")
+
+    async def test_custom_port_is_an_explicit_tcp_port(self):
+        await self.run_until_disconnect(5)
+        self.connection.forward_local_port.assert_awaited_once_with("127.0.0.1", 5, "assigned.example", 5990)
+        self.launch.assert_called_once_with(self.executable, arguments="-useaddressbook 127.0.0.1::5")
+
+    async def test_bind_failure_skips_viewer(self):
+        self.connection.forward_local_port.side_effect = OSError("port busy")
+        with self.assertRaisesRegex(RuntimeError, "port busy"):
+            await connect_vnc("fixture", 5905)
+        self.launch.assert_not_called()
+
+    async def test_launch_failure_keeps_manual_connection_available(self):
+        self.launch.side_effect = FileNotFoundError("missing viewer")
+        await self.run_until_disconnect(5910)
+        self.assertIn("127.0.0.1::5910", self.errors.getvalue())
