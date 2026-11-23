@@ -4,11 +4,15 @@ Opens the VNC desktop assigned by Pascal in RealVNC Viewer.
 .DESCRIPTION
 Signs in once, obtains the verification code from ECB_Dept_AuthCode in
 %LOCALAPPDATA%\ECB\otp.kdbx, and runs vncconnect. Once the SSH tunnel is ready,
-the script opens RealVNC Viewer using the saved connection settings for the
-local address. The default address matches the ECB Computer:5905 connection.
-On first use, enter your passwords at the prompts. A successful SSH login saves
-them in Windows Credential Manager for your Windows account on this computer.
-Later logins use those passwords and get a fresh verification code from KeePassXC.
+the script opens RealVNC Viewer for the local address. It uses a matching saved
+Viewer profile when available. The default address is 127.0.0.1:5905.
+On first use, enter your department and vault passwords at the terminal prompts.
+A successful SSH login saves them in Windows Credential Manager. When prompted
+for the VNC desktop password, enter the password you set with vncconnect.
+The script saves it separately for your department username after Viewer
+confirms the VNC login. Future runs supply it automatically through a private
+Windows pipe. Classic VNC authentication uses the first eight password bytes.
+If Viewer cannot accept the password through the pipe, enter it in Viewer.
 When vncconnect starts a desktop on its assigned host, the script answers the
 department password prompt and gets a separate verification code if requested.
 It waits for a new code if KeePassXC still shows the one used for Pascal.
@@ -21,10 +25,11 @@ Port on 127.0.0.1 for your VNC viewer. Defaults to 5905.
 Department login. Defaults to mtjantzi.
 .PARAMETER PasswordEntry
 Optional path to the KeePassXC entry holding the department password in
-otp.kdbx. With this option, only the vault password is saved in Credential Manager.
+otp.kdbx. The department password is then read from KeePassXC on each login.
 .PARAMETER RefreshPasswords
-Prompt again and replace the saved passwords after a successful SSH login.
-If you use PasswordEntry, edit the department password in KeePassXC.
+Prompt again for the remembered passwords. Each replacement is saved after its
+SSH or VNC login succeeds. If you use PasswordEntry, edit the department password
+in KeePassXC.
 .EXAMPLE
 .\Connect-ECB.ps1
 .EXAMPLE

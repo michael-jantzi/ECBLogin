@@ -2,13 +2,15 @@ import asyncio
 import io
 import os
 import unittest
-from contextlib import ExitStack, asynccontextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, asynccontextmanager, nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncssh
 
-from ecb_login import connect_vnc, discover_vnc
+from ecb_login import LoginClient, connect_vnc, discover_vnc, open_realvnc
+from vnc_password import encode_vnc_password
 
 
 FORWARD = "ssh student@gateway -L 127.0.0.1:5900:cmp10.example:5901\n"
@@ -250,6 +252,9 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ViewerLaunchTests(unittest.IsolatedAsyncioTestCase):
+    pipe_path = r"\\.\pipe\fixture"
+    viewer_pid = 4321
+
     def setUp(self):
         fixtures = ExitStack()
         self.addCleanup(fixtures.close)
@@ -257,13 +262,53 @@ class ViewerLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.connection = ssh.return_value.__aenter__.return_value
         self.listener = MagicMock()
         self.connection.forward_local_port = AsyncMock(return_value=self.listener)
-        self.connection.wait_closed = AsyncMock()
+        self.viewer_done = asyncio.Event()
+
+        async def wait_for_viewer():
+            await asyncio.wait_for(self.viewer_done.wait(), 2)
+
+        self.connection.wait_closed = AsyncMock(side_effect=wait_for_viewer)
         fixtures.enter_context(patch("ecb_login.discover_vnc", return_value=("assigned.example", 5990)))
-        fixtures.enter_context(patch.dict(os.environ, {"ProgramFiles": "C:/Fixture Programs"}))
-        self.executable = Path("C:/Fixture Programs") / "RealVNC" / "VNC Viewer" / "vncviewer.exe"
-        self.launch = fixtures.enter_context(patch("ecb_login.os.startfile", create=True))
+        root = Path(fixtures.enter_context(TemporaryDirectory()))
+        fixtures.enter_context(patch.dict(os.environ, {"ProgramFiles": str(root)}))
+        self.executable = root / "RealVNC" / "VNC Viewer" / "vncviewer.exe"
+        self.executable.parent.mkdir(parents=True)
+        self.executable.touch()
+        self.profile = fixtures.enter_context(patch("ecb_login.find_viewer_profile", return_value=None))
+        self.launch = fixtures.enter_context(patch("ecb_login.asyncio.create_subprocess_exec"))
+        self.manual = fixtures.enter_context(patch("ecb_login.os.startfile", create=True))
+        self.pipe = object()
+        fixtures.enter_context(patch("ecb_login.password_pipe", return_value=nullcontext((self.pipe_path, self.pipe))))
+        self.delivered = asyncio.Event()
+        self.deliver = fixtures.enter_context(patch(
+            "ecb_login.deliver_password", side_effect=lambda *_: self.delivered.set(),
+        ))
+        self.saved = {}
+        fixtures.enter_context(patch("ecb_login.read_password", side_effect=lambda key: self.saved.get(key.casefold())))
+        fixtures.enter_context(patch("ecb_login.save_password", side_effect=self.save))
+        self.prompt = fixtures.enter_context(patch("ecb_login.read_secret", return_value="VncTest!"))
         self.errors = fixtures.enter_context(redirect_stderr(io.StringIO()))
         fixtures.enter_context(redirect_stdout(io.StringIO()))
+
+    def save(self, target, username, password):
+        self.saved[target.casefold()] = password
+
+    def prepare_viewer(self):
+        process = self.launch.return_value
+        process.pid = self.viewer_pid
+        process.stderr = asyncio.StreamReader()
+        process.returncode = 0
+        process.wait = AsyncMock(side_effect=self.viewer_done.set)
+        return process.stderr
+
+    def audit(self, message, pid=None):
+        pid = self.viewer_pid if pid is None else pid
+        return f"<13> 2026-11-23T16:21:46.336Z FIXTURE vncviewer[{pid}]: CConnection: {message}\r\n".encode()
+
+    def accepted_viewer(self):
+        stream = self.prepare_viewer()
+        stream.feed_data(self.audit("Authentication successful"))
+        stream.feed_eof()
 
     async def run_until_disconnect(self, local_port):
         with self.assertRaisesRegex(RuntimeError, "SSH connection closed"):
@@ -271,28 +316,93 @@ class ViewerLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.connection.wait_closed.assert_awaited_once()
 
     async def test_opens_saved_connection_after_local_tunnel_is_ready(self):
+        self.accepted_viewer()
+        profile = Path("School desktop.vnc")
+        self.profile.return_value = profile
+
         def check_listener(*args, **kwargs):
             self.listener.__aenter__.assert_awaited_once()
             self.listener.__aexit__.assert_not_awaited()
-            self.connection.wait_closed.assert_not_awaited()
+            return self.launch.return_value
 
         self.launch.side_effect = check_listener
         await self.run_until_disconnect(5905)
         self.connection.forward_local_port.assert_awaited_once_with("127.0.0.1", 5905, "assigned.example", 5990)
-        self.launch.assert_called_once_with(self.executable, arguments="-useaddressbook 127.0.0.1:5905")
+        args = self.launch.await_args.args
+        self.assertEqual(args[0], self.executable)
+        self.assertEqual(args[-3:], ("127.0.0.1:5905", "-config", profile))
+        self.assertIn(f"-PasswordFile={self.pipe_path}", args)
+        self.assertNotIn(self.prompt.return_value, repr(self.launch.await_args))
 
-    async def test_custom_port_is_an_explicit_tcp_port(self):
-        await self.run_until_disconnect(5)
-        self.connection.forward_local_port.assert_awaited_once_with("127.0.0.1", 5, "assigned.example", 5990)
-        self.launch.assert_called_once_with(self.executable, arguments="-useaddressbook 127.0.0.1::5")
-
-    async def test_bind_failure_skips_viewer(self):
+    async def test_bind_failure_skips_viewer_and_vnc_password_prompt(self):
         self.connection.forward_local_port.side_effect = OSError("port busy")
         with self.assertRaisesRegex(RuntimeError, "port busy"):
             await connect_vnc("fixture", 5905)
-        self.launch.assert_not_called()
+        self.launch.assert_not_awaited()
+        self.prompt.assert_not_called()
 
     async def test_launch_failure_keeps_manual_connection_available(self):
         self.launch.side_effect = FileNotFoundError("missing viewer")
+
+        def manual_launch_fails(*args, **kwargs):
+            self.viewer_done.set()
+            raise FileNotFoundError("missing viewer")
+
+        self.manual.side_effect = manual_launch_fails
         await self.run_until_disconnect(5910)
+        self.manual.assert_called_once_with(self.executable, arguments="-useaddressbook 127.0.0.1::5910")
         self.assertIn("127.0.0.1::5910", self.errors.getvalue())
+        self.assertEqual(self.saved, {})
+
+    async def test_stores_confirmed_password_per_account_and_reuses_it_across_tunnel_ports(self):
+        self.prompt.side_effect = ["ssh fixture", "VncTest!", "OtherVnc"]
+        client = LoginClient("student", None)
+        self.assertEqual(client.password_auth_requested(), "ssh fixture")
+        client.auth_completed()
+        before_vnc = self.saved.copy()
+
+        stream = self.prepare_viewer()
+        pending = asyncio.create_task(open_realvnc(5905, client))
+        try:
+            await asyncio.wait_for(self.delivered.wait(), 2)
+            self.assertEqual(self.saved, before_vnc)
+            self.deliver.assert_awaited_once_with(self.pipe, encode_vnc_password("VncTest!"), self.viewer_pid)
+        finally:
+            stream.feed_data(self.audit("Authentication successful"))
+            stream.feed_eof()
+            await asyncio.wait_for(pending, 2)
+        self.assertCountEqual(self.saved.values(), ["ssh fixture", "VncTest!"])
+
+        self.accepted_viewer()
+        await open_realvnc(5, LoginClient("student", None))
+        self.assertEqual(self.prompt.call_count, 2)
+        self.assertIn("127.0.0.1::5", self.launch.await_args.args)
+        self.deliver.assert_awaited_with(self.pipe, encode_vnc_password("VncTest!"), self.viewer_pid)
+
+        self.accepted_viewer()
+        await open_realvnc(5905, LoginClient("Student", None))
+        self.deliver.assert_awaited_with(self.pipe, encode_vnc_password("OtherVnc"), self.viewer_pid)
+        self.assertCountEqual(self.saved.values(), ["ssh fixture", "VncTest!", "OtherVnc"])
+
+    async def test_refresh_preserves_password_on_rejection_unrelated_success_or_eof(self):
+        self.accepted_viewer()
+        await open_realvnc(5905, LoginClient("student", None))
+        original = self.saved.copy()
+        self.prompt.return_value = "NewVnc!!"
+        success = self.audit("Authentication successful")
+        rejected = self.audit("close: [AuthFailure] vncviewer[4321]: CConnection: Authentication successful")
+        for log in [b"", self.audit("Authentication successful", pid=9876), rejected + success]:
+            with self.subTest(log=log):
+                stream = self.prepare_viewer()
+                stream.feed_data(log)
+                stream.feed_eof()
+                client = LoginClient("student", None, refresh_passwords=True)
+                await open_realvnc(5905, client)
+                self.assertEqual(self.saved, original)
+                self.assertEqual(client.pending_passwords, {})
+
+        self.accepted_viewer()
+        await open_realvnc(5905, LoginClient("student", None, refresh_passwords=True))
+        self.assertEqual(self.saved.keys(), original.keys())
+        self.assertEqual(list(self.saved.values()), ["NewVnc!!"])
+        self.assertNotIn("NewVnc!!", self.errors.getvalue())

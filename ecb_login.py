@@ -7,11 +7,14 @@ import os
 import re
 import subprocess
 import sys
+from contextlib import suppress
 from pathlib import Path
 
 import asyncssh
 
 from ecb_credentials import read_password, save_password
+from ecb_viewer_profile import find_viewer_profile
+from vnc_password import deliver_password, encode_vnc_password, password_pipe
 
 
 GATEWAY = "pascal.ee.ryerson.ca"
@@ -48,6 +51,11 @@ class LoginClient(asyncssh.SSHClient):
         self.department_password = None
         self.gateway_code = None
         self.answered = set()
+
+    def account_target(self, service):
+        # Credential Manager targets are case-insensitive, but department usernames are case-sensitive.
+        account_key = self.username.encode("utf-8").hex()
+        return f"ECB Login Script/{service}/{GATEWAY}/{account_key}"
 
     def get_password(self, target, account, prompt):
         if not self.refresh_passwords:
@@ -100,10 +108,8 @@ class LoginClient(asyncssh.SSHClient):
             if self.password_entry:
                 self.department_password = self.read_entry(self.password_entry, "--attributes", "Password")
             else:
-                # Credential Manager matches targets without case sensitivity. SSH usernames are case-sensitive.
-                account_key = self.username.encode("utf-8").hex()
                 self.department_password = self.get_password(
-                    f"ECB Login Script/SSH/{GATEWAY}/{account_key}",
+                    self.account_target("SSH"),
                     self.username,
                     f"Department password for {self.username}: ",
                 )
@@ -155,7 +161,7 @@ class LoginClient(asyncssh.SSHClient):
             try:
                 save_password(target, account, password)
             except RuntimeError as exc:
-                print(f"{exc} The SSH login succeeded, but this password was not saved.", file=sys.stderr)
+                print(f"{exc} This password could not be saved for the next login.", file=sys.stderr)
         self.pending_passwords.clear()
 
     def clear_credentials(self):
@@ -270,14 +276,80 @@ async def discover_vnc(connection, department_password=None, get_verification_co
     raise RuntimeError(f"{failure}\n{detail}" if detail else failure)
 
 
-def open_realvnc(local_port):
+async def viewer_accepted_password(process):
+    # Read only this Viewer's authentication result. A later manual retry can use a different password.
+    header = re.compile(
+        rb"^(?:<[0-9]+> \S+ \S+ )?vncviewer\[" + str(process.pid).encode("ascii") + rb"\]: CConnection: "
+    )
+    while line := await process.stderr.readline():
+        match = header.match(line)
+        if not match:
+            continue
+        message = line[match.end():].rstrip(b"\r\n")
+        if message == b"Authentication successful":
+            return True
+        if message.startswith(b"close:"):
+            break
+    return False
+
+
+async def open_realvnc(local_port, client):
     # Match the saved ECB address exactly. For custom ports, :: forces a TCP port even below 100.
     address = f"{LOOPBACK}:{local_port}" if local_port == DEFAULT_LOCAL_PORT else f"{LOOPBACK}::{local_port}"
     viewer = Path(os.environ["ProgramFiles"]) / "RealVNC" / "VNC Viewer" / "vncviewer.exe"
+    target = client.account_target("VNC")
+    process = None
     try:
-        os.startfile(viewer, arguments=f"-useaddressbook {address}")
-    except OSError as exc:
-        print(f"Could not open RealVNC Viewer ({exc}). Enter {address} in your viewer.", file=sys.stderr)
+        try:
+            if not viewer.is_file():
+                raise FileNotFoundError(viewer)
+            encoded = encode_vnc_password(client.get_password(
+                target, client.username, f"VNC desktop password for {client.username}: ",
+            ))
+            profile = find_viewer_profile(local_port)
+            with password_pipe() as (path, pipe):
+                args = [
+                    viewer, "-UseAddressBook=0", "-LogToAddressBook=0", "-Log=CConnection:stderr:10",
+                    f"-PasswordFile={path}", address,
+                ]
+                if profile is not None:
+                    args.extend(["-config", profile])
+                process = await asyncio.create_subprocess_exec(
+                    *args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                )
+                await deliver_password(pipe, encoded, process.pid)
+            del encoded
+            try:
+                accepted = await asyncio.wait_for(viewer_accepted_password(process), 120)
+            except asyncio.TimeoutError:
+                accepted = False
+            if accepted:
+                client.save_pending_passwords()
+            else:
+                print(
+                    r"VNC login was not confirmed. To replace a saved password, run .\Connect-ECB.ps1 -RefreshPasswords.",
+                    file=sys.stderr,
+                )
+        except (OSError, RuntimeError, ValueError, EOFError) as exc:
+            print(f"Automatic VNC login unavailable ({exc}). Enter the password in RealVNC Viewer.", file=sys.stderr)
+            if process is None:
+                try:
+                    os.startfile(viewer, arguments=f"-useaddressbook {address}")
+                except OSError as launch_error:
+                    print(f"Could not open RealVNC Viewer ({launch_error}). Enter {address} in your viewer.", file=sys.stderr)
+        finally:
+            client.pending_passwords.pop(target, None)
+
+        if process is not None:
+            # Keep stderr drained while the desktop is open, including after a manual retry.
+            while await process.stderr.read(4096):
+                pass
+            await process.wait()
+    finally:
+        if process is not None and process.returncode is None:
+            with suppress(ProcessLookupError):
+                process.terminate()
+            await process.communicate()
 
 
 async def connect_vnc(username, local_port, password_entry=None, refresh_passwords=False):
@@ -305,9 +377,14 @@ async def connect_vnc(username, local_port, password_entry=None, refresh_passwor
             raise RuntimeError(f"Could not listen on {LOOPBACK}:{local_port}. Try another -LocalPort. {exc}") from exc
         async with listener:
             print(f"VNC tunnel ready: {LOOPBACK}:{local_port} -> {host}:{port}", flush=True)
-            open_realvnc(local_port)
             print("Keep this window open while using VNC. Press Ctrl+C to close the tunnel.", flush=True)
-            await connection.wait_closed()
+            viewer_task = asyncio.create_task(open_realvnc(local_port, client))
+            try:
+                await connection.wait_closed()
+            finally:
+                viewer_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await viewer_task
             raise RuntimeError("The SSH connection closed. Run Connect-ECB again to reconnect.")
 
 
