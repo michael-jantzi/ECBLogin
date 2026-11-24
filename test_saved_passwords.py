@@ -137,6 +137,17 @@ class SavedPasswordTests(unittest.TestCase):
         rollover.assert_not_awaited()
         self.assertCountEqual(self.saved.values(), ["department password", self.unlock])
 
+    def test_lab_login_retry_waits_for_a_code_unused_by_either_ssh_login(self):
+        self.codes = iter(["123456", "234567", "234567", "123456", "345678"])
+        self.prompt.side_effect = ["department password", self.unlock]
+        client = self.login("fixture", "department password", "123456")
+        client.auth_completed()
+        self.assertEqual(asyncio.run(client.host_verification_code()), "234567")
+        with patch.object(ecb_login.asyncio, "sleep") as rollover:
+            self.assertEqual(asyncio.run(client.host_verification_code()), "345678")
+        self.assertEqual(rollover.await_count, 2)
+        self.assertEqual(self.prompt.call_count, 2)
+
     def test_disconnect_while_waiting_for_rollover_stops_vault_access(self):
         self.codes = iter(["123456", "123456"])
         self.prompt.side_effect = ["department password", self.unlock]
@@ -167,4 +178,5 @@ class SavedPasswordTests(unittest.TestCase):
         self.assertIsNone(client.department_password)
         self.assertNotIn("123456", vars(client).values())
         self.assertEqual(client.pending_passwords, {})
+        self.assertEqual(client.used_verification_codes, set())
         self.assertEqual(self.saved, {})

@@ -1,4 +1,4 @@
-"""Connect a local VNC viewer to the desktop assigned by Pascal."""
+"""Open the desktop assigned by Pascal in RealVNC Viewer through an SSH tunnel."""
 
 import argparse
 import asyncio
@@ -7,18 +7,25 @@ import os
 import re
 import subprocess
 import sys
+from contextlib import suppress
 from pathlib import Path
 
 import asyncssh
 
 from ecb_credentials import read_password, save_password
+from ecb_viewer_profile import find_viewer_profile
+from vnc_password import deliver_password, encode_vnc_password, password_pipe
 
 
 GATEWAY = "pascal.ee.ryerson.ca"
 LOOPBACK = "127.0.0.1"
+DEFAULT_LOCAL_PORT = 5905
 OTP_ENTRY = "ECB_Dept_AuthCode"
 VNC_IDLE_TIMEOUT = 90
 HOST_PROMPT = re.compile(r"^[ \t]*(Password|Verification code):[ \t\r\n]*\Z", re.IGNORECASE | re.MULTILINE)
+HOST_RETRY_PROMPT = re.compile(
+    r"\s*(?:Permission denied, please try again\.\s*)?Password:\s*\Z", re.IGNORECASE
+)
 # Pascal wraps this notice across lines and spells "invoke" as "envoke".
 DEPARTMENT_NOTICE = re.compile(
     r"\bFound system: (?P<host>[a-z0-9][a-z0-9.-]*) Connecting you to the host\. "
@@ -46,7 +53,13 @@ class LoginClient(asyncssh.SSHClient):
         self.database_password = None
         self.department_password = None
         self.gateway_code = None
+        self.used_verification_codes = set()
         self.answered = set()
+
+    def account_target(self, service):
+        # Credential Manager targets are case-insensitive, but department usernames are case-sensitive.
+        account_key = self.username.encode("utf-8").hex()
+        return f"ECB Login Script/{service}/{GATEWAY}/{account_key}"
 
     def get_password(self, target, account, prompt):
         if not self.refresh_passwords:
@@ -99,15 +112,14 @@ class LoginClient(asyncssh.SSHClient):
             if self.password_entry:
                 self.department_password = self.read_entry(self.password_entry, "--attributes", "Password")
             else:
-                # Credential Manager matches targets without case sensitivity. SSH usernames are case-sensitive.
-                account_key = self.username.encode("utf-8").hex()
                 self.department_password = self.get_password(
-                    f"ECB Login Script/SSH/{GATEWAY}/{account_key}",
+                    self.account_target("SSH"),
                     self.username,
                     f"Department password for {self.username}: ",
                 )
             return self.department_password
         self.gateway_code = self.read_verification_code()
+        self.used_verification_codes.add(self.gateway_code)
         return self.gateway_code
 
     def read_verification_code(self):
@@ -117,18 +129,21 @@ class LoginClient(asyncssh.SSHClient):
         return code
 
     async def host_verification_code(self):
+        if self.gateway_code is None:
+            raise RuntimeError("The SSH connection closed before requesting the lab-PC verification code.")
         code = self.read_verification_code()
-        if code == self.gateway_code:
+        if code in self.used_verification_codes:
             print("Waiting for KeePassXC to generate the next verification code ...", flush=True)
             loop = asyncio.get_running_loop()
             deadline = loop.time() + 90
-            while code == self.gateway_code:
+            while code in self.used_verification_codes:
                 if loop.time() >= deadline:
                     raise RuntimeError("KeePassXC did not generate a new verification code within 90 seconds.")
                 await asyncio.sleep(2)
                 if self.gateway_code is None:
                     raise RuntimeError("The SSH connection closed while waiting for the VNC verification code.")
                 code = self.read_verification_code()
+        self.used_verification_codes.add(code)
         return code
 
     def kbdint_auth_requested(self):
@@ -154,13 +169,14 @@ class LoginClient(asyncssh.SSHClient):
             try:
                 save_password(target, account, password)
             except RuntimeError as exc:
-                print(f"{exc} The SSH login succeeded, but this password was not saved.", file=sys.stderr)
+                print(f"{exc} This password could not be saved for the next login.", file=sys.stderr)
         self.pending_passwords.clear()
 
     def clear_credentials(self):
         self.database_password = None
         self.department_password = None
         self.gateway_code = None
+        self.used_verification_codes.clear()
         self.pending_passwords.clear()
 
     def connection_lost(self, exc):
@@ -197,6 +213,8 @@ async def discover_vnc(connection, department_password=None, get_verification_co
     pending = ""
     started = False
     last_factor = None
+    password_retries = 0
+    service_started = False
     failure = None
     async with connection.create_process(
         term_type="dumb",
@@ -220,13 +238,39 @@ async def discover_vnc(connection, department_password=None, get_verification_co
                     if not separator:
                         continue
                     started, pending = True, body
+                service_started = service_started or "Please wait for service to begin ..." in pending
                 prompt = HOST_PROMPT.search(pending)
                 if not prompt:
                     continue
+                if service_started:
+                    failure = (
+                        "The lab PC logged in, but VNC startup requested additional authentication. "
+                        "Run vncconnect interactively on Pascal to inspect the request."
+                    )
+                    break
                 factor = prompt[1].lower()
                 if factor == "password":
-                    if last_factor is not None or not DEPARTMENT_NOTICE.search(" ".join(pending.split())):
-                        failure = "vncconnect requested an unexpected password. Run it interactively on Pascal."
+                    if last_factor == "verification code":
+                        # Some PTYs echo the submitted code and erase it with backspaces.
+                        pending = pending.replace(code, "").replace("\b", "")
+                    if last_factor is None:
+                        if not DEPARTMENT_NOTICE.search(" ".join(pending.split())):
+                            failure = "vncconnect requested an unexpected password. Run it interactively on Pascal."
+                            break
+                    elif (
+                        last_factor == "verification code" and password_retries == 0
+                        and HOST_RETRY_PROMPT.fullmatch(pending)
+                    ):
+                        password_retries += 1
+                        print(
+                            "The lab PC requested another SSH login. Retrying once with a fresh verification code ...",
+                            flush=True,
+                        )
+                    else:
+                        failure = (
+                            "The lab PC repeated its SSH password prompt. "
+                            "Check the department password and verification code, then reconnect."
+                        )
                         break
                     if department_password is None or re.search(r"[\x00-\x1f\x7f]", department_password):
                         failure = "The SSH password cannot be used for this terminal prompt. Run vncconnect on Pascal."
@@ -269,6 +313,82 @@ async def discover_vnc(connection, department_password=None, get_verification_co
     raise RuntimeError(f"{failure}\n{detail}" if detail else failure)
 
 
+async def viewer_accepted_password(process):
+    # Read only this Viewer's authentication result. A later manual retry can use a different password.
+    header = re.compile(
+        rb"^(?:<[0-9]+> \S+ \S+ )?vncviewer\[" + str(process.pid).encode("ascii") + rb"\]: CConnection: "
+    )
+    while line := await process.stderr.readline():
+        match = header.match(line)
+        if not match:
+            continue
+        message = line[match.end():].rstrip(b"\r\n")
+        if message == b"Authentication successful":
+            return True
+        if message.startswith(b"close:"):
+            break
+    return False
+
+
+async def open_realvnc(local_port, client):
+    # Match the saved ECB address exactly. For custom ports, :: forces a TCP port even below 100.
+    address = f"{LOOPBACK}:{local_port}" if local_port == DEFAULT_LOCAL_PORT else f"{LOOPBACK}::{local_port}"
+    viewer = Path(os.environ["ProgramFiles"]) / "RealVNC" / "VNC Viewer" / "vncviewer.exe"
+    target = client.account_target("VNC")
+    process = None
+    try:
+        try:
+            if not viewer.is_file():
+                raise FileNotFoundError(viewer)
+            encoded = encode_vnc_password(client.get_password(
+                target, client.username, f"VNC desktop password for {client.username}: ",
+            ))
+            profile = find_viewer_profile(local_port)
+            with password_pipe() as (path, pipe):
+                args = [
+                    viewer, "-UseAddressBook=0", "-LogToAddressBook=0", "-Log=CConnection:stderr:10",
+                    f"-PasswordFile={path}", address,
+                ]
+                if profile is not None:
+                    args.extend(["-config", profile])
+                process = await asyncio.create_subprocess_exec(
+                    *args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                )
+                await deliver_password(pipe, encoded, process.pid)
+            del encoded
+            try:
+                accepted = await asyncio.wait_for(viewer_accepted_password(process), 120)
+            except asyncio.TimeoutError:
+                accepted = False
+            if accepted:
+                client.save_pending_passwords()
+            else:
+                print(
+                    r"VNC login was not confirmed. To replace a saved password, run .\Connect-ECB.ps1 -RefreshPasswords.",
+                    file=sys.stderr,
+                )
+        except (OSError, RuntimeError, ValueError, EOFError) as exc:
+            print(f"Automatic VNC login unavailable ({exc}). Enter the password in RealVNC Viewer.", file=sys.stderr)
+            if process is None:
+                try:
+                    os.startfile(viewer, arguments=f"-useaddressbook {address}")
+                except OSError as launch_error:
+                    print(f"Could not open RealVNC Viewer ({launch_error}). Enter {address} in your viewer.", file=sys.stderr)
+        finally:
+            client.pending_passwords.pop(target, None)
+
+        if process is not None:
+            # Keep stderr drained while the desktop is open, including after a manual retry.
+            while await process.stderr.read(4096):
+                pass
+            await process.wait()
+    finally:
+        if process is not None and process.returncode is None:
+            with suppress(ProcessLookupError):
+                process.terminate()
+            await process.communicate()
+
+
 async def connect_vnc(username, local_port, password_entry=None, refresh_passwords=False):
     print(f"Connecting to {username}@{GATEWAY} ...", flush=True)
     client = LoginClient(username, password_entry, refresh_passwords)
@@ -295,14 +415,20 @@ async def connect_vnc(username, local_port, password_entry=None, refresh_passwor
         async with listener:
             print(f"VNC tunnel ready: {LOOPBACK}:{local_port} -> {host}:{port}", flush=True)
             print("Keep this window open while using VNC. Press Ctrl+C to close the tunnel.", flush=True)
-            await connection.wait_closed()
+            viewer_task = asyncio.create_task(open_realvnc(local_port, client))
+            try:
+                await connection.wait_closed()
+            finally:
+                viewer_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await viewer_task
             raise RuntimeError("The SSH connection closed. Run Connect-ECB again to reconnect.")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--username", default="mtjantzi")
-    parser.add_argument("--local-port", type=int, default=5905)
+    parser.add_argument("--local-port", type=int, default=DEFAULT_LOCAL_PORT)
     parser.add_argument("--password-entry", help="KeePassXC entry containing the department password")
     parser.add_argument("--refresh-passwords", action="store_true", help="replace remembered passwords after login")
     args = parser.parse_args()
