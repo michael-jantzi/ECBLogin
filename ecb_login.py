@@ -55,6 +55,8 @@ class LoginClient(asyncssh.SSHClient):
         self.database_password = None
         self.department_password = None
         self.gateway_code = None
+        self.gateway_retries = 0
+        self.gateway_retry_code = False
         self.used_verification_codes = set()
         self.answered = set()
 
@@ -111,6 +113,15 @@ class LoginClient(asyncssh.SSHClient):
 
     def answer_once(self, factor):
         if factor in self.answered:
+            if factor == "password":
+                if self.gateway_code is not None:
+                    raise asyncssh.PermissionDenied(
+                        "Pascal restarted login after the verification code. The code may have expired or been used already. "
+                        "Check the computer's date/time and reconnect with a fresh code."
+                    )
+                raise asyncssh.PermissionDenied(
+                    "Pascal rejected the department password before requesting a verification code."
+                )
             raise asyncssh.PermissionDenied(
                 f"Pascal requested the {factor} again. Check your credentials and reconnect."
             )
@@ -135,9 +146,9 @@ class LoginClient(asyncssh.SSHClient):
             raise RuntimeError(f"KeePassXC did not return a numeric verification code for {OTP_ENTRY}.")
         return code
 
-    async def host_verification_code(self):
+    async def unused_verification_code(self, context):
         if self.gateway_code is None:
-            raise RuntimeError("The SSH connection closed before requesting the lab-PC verification code.")
+            raise RuntimeError(f"The SSH connection closed before requesting the {context} verification code.")
         code = self.read_verification_code()
         if code in self.used_verification_codes:
             print("Waiting for KeePassXC to generate the next verification code ...", flush=True)
@@ -148,25 +159,49 @@ class LoginClient(asyncssh.SSHClient):
                     raise RuntimeError("KeePassXC did not generate a new verification code within 90 seconds.")
                 await asyncio.sleep(2)
                 if self.gateway_code is None:
-                    raise RuntimeError("The SSH connection closed while waiting for the VNC verification code.")
+                    raise RuntimeError(f"The SSH connection closed while waiting for the {context} verification code.")
                 code = self.read_verification_code()
         self.used_verification_codes.add(code)
         return code
 
+    async def host_verification_code(self):
+        return await self.unused_verification_code("VNC")
+
     def kbdint_auth_requested(self):
         return ""  # Let Pascal select its keyboard-interactive mechanism.
 
-    def kbdint_challenge_received(self, name, instructions, lang, prompts):
+    async def kbdint_challenge_received(self, name, instructions, lang, prompts):
         responses = []
         for prompt, _echo in prompts:
             label = prompt.rsplit(")", 1)[-1].strip().rstrip(":").strip().lower()
             if label not in {"password", "verification code"}:
                 raise asyncssh.PermissionDenied("Pascal sent an unrecognized authentication prompt.")
-            responses.append(self.answer_once(label))
+            if (label == "password" and label in self.answered and self.gateway_code is not None
+                    and self.gateway_retries == 0 and self.department_password is not None):
+                # PAM can restart the entire conversation after rejecting an OTP.
+                # Reuse the department password once, then wait for an unused code.
+                self.gateway_retries += 1
+                self.gateway_retry_code = True
+                self.answered = {"password"}
+                responses.append(self.department_password)
+                print("Pascal restarted login after verification. Retrying once with a fresh verification code ...", flush=True)
+            elif label == "verification code" and self.gateway_retry_code and label not in self.answered:
+                self.gateway_code = await self.unused_verification_code("Pascal")
+                self.gateway_retry_code = False
+                self.answered.add(label)
+                responses.append(self.gateway_code)
+            else:
+                responses.append(self.answer_once(label))
+            if label == "password":
+                print("Department password sent to Pascal.", flush=True)
+            else:
+                print("Verification code sent to Pascal.", flush=True)
         return responses
 
     def password_auth_requested(self):
-        return self.answer_once("password")
+        password = self.answer_once("password")
+        print("Department password sent to Pascal.", flush=True)
+        return password
 
     def auth_completed(self):
         self.save_pending_passwords()
@@ -186,6 +221,8 @@ class LoginClient(asyncssh.SSHClient):
         self.database_password = None
         self.department_password = None
         self.gateway_code = None
+        self.gateway_retries = 0
+        self.gateway_retry_code = False
         self.used_verification_codes.clear()
         self.pending_passwords.clear()
 

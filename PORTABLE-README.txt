@@ -14,6 +14,13 @@ Before a connection, you can open a terminal in this folder and run:
 This checks files, SSH trust, and the KeePassXC runtime without unlocking the
 vault or contacting the school. A successful check does not test the login.
 
+Login progress identifies when the department password and verification code
+are sent, without displaying either secret. If Pascal restarts login after
+verification, the app retries once with the same password and waits for an
+unused code. If that fails too, check the PC's date/time and retry. A password
+rejected before verification stops immediately; use --refresh-passwords if
+the encrypted USB copy has an outdated department password.
+
 Settings live in data/settings.json. You can change username and local_port.
 password_entry may name an existing KeePassXC entry for the department password;
 leave it null to use the app's account-specific encrypted password entries.

@@ -52,7 +52,7 @@ class SavedPasswordTests(unittest.TestCase):
         return subprocess.CompletedProcess(args, 0, stdout=(value + "\r\n").encode())
 
     def challenge(self, client, prompt):
-        return client.kbdint_challenge_received("", "", "", [(prompt, False)])[0]
+        return asyncio.run(client.kbdint_challenge_received("", "", "", [(prompt, False)]))[0]
 
     def login(self, username, password, code, *, password_entry=None, refresh_passwords=False):
         client = ecb_login.LoginClient(username, password_entry, refresh_passwords=refresh_passwords)
@@ -136,6 +136,33 @@ class SavedPasswordTests(unittest.TestCase):
             self.assertEqual(asyncio.run(client.host_verification_code()), "234567")
         rollover.assert_not_awaited()
         self.assertCountEqual(self.saved.values(), ["department password", self.unlock])
+
+    def test_gateway_retry_waits_for_rollover_and_lab_login_avoids_both_gateway_codes(self):
+        self.prompt.side_effect = ["department password", self.unlock]
+        self.codes = iter(["123456", "123456", "234567", "123456", "234567", "345678"])
+        client = self.login("fixture", "department password", "123456")
+        self.assertEqual(self.challenge(client, "Password:"), "department password")
+        with patch.object(ecb_login.asyncio, "sleep") as rollover:
+            self.assertEqual(self.challenge(client, "Verification code:"), "234567")
+        rollover.assert_awaited_once()
+        with patch.object(ecb_login.asyncio, "sleep") as rollover:
+            self.assertEqual(asyncio.run(client.host_verification_code()), "345678")
+        self.assertEqual(rollover.await_count, 2)
+        self.assertEqual(client.used_verification_codes, {"123456", "234567", "345678"})
+        self.assertEqual(self.prompt.call_count, 2)
+        self.assertEqual(self.saved, {})
+
+    def test_disconnect_while_waiting_for_gateway_retry_discards_pending_credentials(self):
+        self.prompt.side_effect = ["department password", self.unlock]
+        self.codes = iter(["123456", "123456"])
+        client = self.login("fixture", "department password", "123456")
+        self.challenge(client, "Password:")
+        with patch.object(ecb_login.asyncio, "sleep", side_effect=lambda _: client.connection_lost(None)):
+            with self.assertRaisesRegex(RuntimeError, "Pascal verification code"):
+                self.challenge(client, "Verification code:")
+        self.assertEqual(client.pending_passwords, {})
+        self.assertIsNone(client.department_password)
+        self.assertEqual(self.saved, {})
 
     def test_lab_login_retry_waits_for_a_code_unused_by_either_ssh_login(self):
         self.codes = iter(["123456", "234567", "234567", "123456", "345678"])

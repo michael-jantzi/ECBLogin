@@ -54,6 +54,85 @@ class FixtureGateway(asyncssh.SSHServer):
         return False
 
 
+class GatewayAuthenticationTests(unittest.IsolatedAsyncioTestCase):
+    async def authenticate(self, behavior):
+        responses = []
+
+        class AuthenticationGateway(asyncssh.SSHServer):
+            def begin_auth(self, username):
+                return True
+
+            def kbdint_auth_supported(self):
+                return True
+
+            def get_kbdint_challenge(self, username, lang, submethods):
+                return "", "", "", [("Password:", False)]
+
+            def validate_kbdint_response(self, username, answers):
+                responses.extend(answers)
+                if len(responses) == 1:
+                    label = "Password:" if behavior == "reject_password" else "Verification code:"
+                elif len(responses) == 2:
+                    label = "Verification code:" if behavior == "repeat_code" else "Password:"
+                elif len(responses) == 3:
+                    label = "Verification code:"
+                elif behavior == "reject_retry":
+                    label = "Password:"
+                else:
+                    return responses == [PASSWORD, "123456", PASSWORD, "234567"]
+                return "", "", "", [(label, False)]
+
+        key = asyncssh.generate_private_key("ssh-ed25519")
+        client = LoginClient("fixture", None)
+        with ExitStack() as fixtures:
+            fixtures.enter_context(patch("ecb_login.read_password", return_value=PASSWORD))
+            fixtures.enter_context(patch("ecb_login.save_password"))
+            prompt = fixtures.enter_context(patch("ecb_login.read_secret", side_effect=AssertionError("unnecessary password prompt")))
+            codes = fixtures.enter_context(patch.object(client, "read_verification_code", side_effect=["123456", "234567"]))
+            log = fixtures.enter_context(redirect_stdout(io.StringIO()))
+            async with asyncssh.listen("127.0.0.1", 0, server_factory=AuthenticationGateway, server_host_keys=[key]) as server:
+                try:
+                    async with asyncssh.connect(
+                        "127.0.0.1", server.get_port(), username="fixture", client_factory=lambda: client,
+                        config=None, known_hosts=([key.convert_to_public()], [], []),
+                        client_keys=[], agent_path=None, preferred_auth=("keyboard-interactive",), login_timeout=3,
+                    ):
+                        self.assertEqual(responses, [PASSWORD, "123456", PASSWORD, "234567"])
+                except asyncssh.PermissionDenied as exc:
+                    error = str(exc)
+                else:
+                    error = None
+            prompt.assert_not_called()
+            self.assertNotIn(PASSWORD, log.getvalue())
+            self.assertNotIn("123456", log.getvalue())
+            self.assertNotIn("234567", log.getvalue())
+        return responses, codes.call_count, error
+
+    async def test_gateway_restart_reuses_password_once_and_sends_a_fresh_code(self):
+        responses, count, error = await self.authenticate("restart_after_code")
+        self.assertIsNone(error)
+        self.assertEqual(count, 2)
+        self.assertEqual(len(responses), 4)
+
+    async def test_wrong_password_is_not_retried_before_verification(self):
+        responses, count, error = await self.authenticate("reject_password")
+        self.assertIn("before requesting a verification code", error)
+        self.assertEqual(responses, [PASSWORD])
+        self.assertEqual(count, 0)
+
+    async def test_gateway_retry_stops_after_one_fresh_code_attempt(self):
+        responses, count, error = await self.authenticate("reject_retry")
+        self.assertIn("Check the computer's date/time", error)
+        self.assertEqual(count, 2)
+        self.assertEqual(len(responses), 4)
+
+    async def test_repeated_verification_without_password_restart_is_rejected(self):
+        responses, count, error = await self.authenticate("repeat_code")
+        self.assertIn("verification code again", error)
+        self.assertEqual(count, 1)
+        self.assertEqual(responses, [PASSWORD, "123456"])
+
+
 @asynccontextmanager
 async def gateway(output, status=0, *, before_marker=None, after_marker=None):
     async def session(process):
