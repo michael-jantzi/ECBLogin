@@ -23,6 +23,9 @@ DEFAULT_LOCAL_PORT = 5905
 OTP_ENTRY = "ECB_Dept_AuthCode"
 VNC_IDLE_TIMEOUT = 90
 HOST_PROMPT = re.compile(r"^[ \t]*(Password|Verification code):[ \t\r\n]*\Z", re.IGNORECASE | re.MULTILINE)
+HOST_RETRY_PROMPT = re.compile(
+    r"\s*(?:Permission denied, please try again\.\s*)?Password:\s*\Z", re.IGNORECASE
+)
 # Pascal wraps this notice across lines and spells "invoke" as "envoke".
 DEPARTMENT_NOTICE = re.compile(
     r"\bFound system: (?P<host>[a-z0-9][a-z0-9.-]*) Connecting you to the host\. "
@@ -50,6 +53,7 @@ class LoginClient(asyncssh.SSHClient):
         self.database_password = None
         self.department_password = None
         self.gateway_code = None
+        self.used_verification_codes = set()
         self.answered = set()
 
     def account_target(self, service):
@@ -115,6 +119,7 @@ class LoginClient(asyncssh.SSHClient):
                 )
             return self.department_password
         self.gateway_code = self.read_verification_code()
+        self.used_verification_codes.add(self.gateway_code)
         return self.gateway_code
 
     def read_verification_code(self):
@@ -124,18 +129,21 @@ class LoginClient(asyncssh.SSHClient):
         return code
 
     async def host_verification_code(self):
+        if self.gateway_code is None:
+            raise RuntimeError("The SSH connection closed before requesting the lab-PC verification code.")
         code = self.read_verification_code()
-        if code == self.gateway_code:
+        if code in self.used_verification_codes:
             print("Waiting for KeePassXC to generate the next verification code ...", flush=True)
             loop = asyncio.get_running_loop()
             deadline = loop.time() + 90
-            while code == self.gateway_code:
+            while code in self.used_verification_codes:
                 if loop.time() >= deadline:
                     raise RuntimeError("KeePassXC did not generate a new verification code within 90 seconds.")
                 await asyncio.sleep(2)
                 if self.gateway_code is None:
                     raise RuntimeError("The SSH connection closed while waiting for the VNC verification code.")
                 code = self.read_verification_code()
+        self.used_verification_codes.add(code)
         return code
 
     def kbdint_auth_requested(self):
@@ -168,6 +176,7 @@ class LoginClient(asyncssh.SSHClient):
         self.database_password = None
         self.department_password = None
         self.gateway_code = None
+        self.used_verification_codes.clear()
         self.pending_passwords.clear()
 
     def connection_lost(self, exc):
@@ -204,6 +213,8 @@ async def discover_vnc(connection, department_password=None, get_verification_co
     pending = ""
     started = False
     last_factor = None
+    password_retries = 0
+    service_started = False
     failure = None
     async with connection.create_process(
         term_type="dumb",
@@ -227,13 +238,39 @@ async def discover_vnc(connection, department_password=None, get_verification_co
                     if not separator:
                         continue
                     started, pending = True, body
+                service_started = service_started or "Please wait for service to begin ..." in pending
                 prompt = HOST_PROMPT.search(pending)
                 if not prompt:
                     continue
+                if service_started:
+                    failure = (
+                        "The lab PC logged in, but VNC startup requested additional authentication. "
+                        "Run vncconnect interactively on Pascal to inspect the request."
+                    )
+                    break
                 factor = prompt[1].lower()
                 if factor == "password":
-                    if last_factor is not None or not DEPARTMENT_NOTICE.search(" ".join(pending.split())):
-                        failure = "vncconnect requested an unexpected password. Run it interactively on Pascal."
+                    if last_factor == "verification code":
+                        # Some PTYs echo the submitted code and erase it with backspaces.
+                        pending = pending.replace(code, "").replace("\b", "")
+                    if last_factor is None:
+                        if not DEPARTMENT_NOTICE.search(" ".join(pending.split())):
+                            failure = "vncconnect requested an unexpected password. Run it interactively on Pascal."
+                            break
+                    elif (
+                        last_factor == "verification code" and password_retries == 0
+                        and HOST_RETRY_PROMPT.fullmatch(pending)
+                    ):
+                        password_retries += 1
+                        print(
+                            "The lab PC requested another SSH login. Retrying once with a fresh verification code ...",
+                            flush=True,
+                        )
+                    else:
+                        failure = (
+                            "The lab PC repeated its SSH password prompt. "
+                            "Check the department password and verification code, then reconnect."
+                        )
                         break
                     if department_password is None or re.search(r"[\x00-\x1f\x7f]", department_password):
                         failure = "The SSH password cannot be used for this terminal prompt. Run vncconnect on Pascal."

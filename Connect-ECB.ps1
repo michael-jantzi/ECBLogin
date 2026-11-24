@@ -15,7 +15,8 @@ Windows pipe. Classic VNC authentication uses the first eight password bytes.
 If Viewer cannot accept the password through the pipe, enter it in Viewer.
 When vncconnect starts a desktop on its assigned host, the script answers the
 department password prompt and gets a separate verification code if requested.
-It waits for a new code if KeePassXC still shows the one used for Pascal.
+It waits for a code unused by either SSH login in this run. If the lab PC repeats
+its password prompt after verification, the script retries that login once.
 Startup continues while Pascal sends progress. After 90 seconds without output,
 the script reports a timeout.
 Leave this window open while using VNC. Press Ctrl+C to disconnect.

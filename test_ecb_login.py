@@ -181,6 +181,69 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(responses, [PASSWORD + "\n", VERIFICATION_CODE + "\n"])
         get_code.assert_awaited_once_with()
 
+    async def test_expired_session_retries_lab_authentication_after_verification(self):
+        responses = []
+        next_code = "004218"
+        get_code = AsyncMock(side_effect=[VERIFICATION_CODE, next_code])
+
+        async def start_desktop(process):
+            process.stdout.write("\nNo active sessions found. Looking for free system...\n")
+            responses.extend(await request_both_factors(process))
+            await write_prompt(process, "\nPassword:", trailing_space=True)
+            responses.append(await read_response(process, 2))
+            await write_prompt(process, "\nVerification code:")
+            responses.append(await read_response(process, 2))
+            process.stdout.write("\nPlease wait for service to begin ...\n")
+
+        async with gateway(FORWARD.replace("cmp10", "cmp11"), after_marker=start_desktop) as connection:
+            result = await asyncio.wait_for(discover_vnc(connection, PASSWORD, get_code), 5)
+        self.assertEqual(result, ("cmp11.example", 5901))
+        self.assertEqual(responses, [PASSWORD + "\n", VERIFICATION_CODE + "\n", PASSWORD + "\n", next_code + "\n"])
+        self.assertEqual(get_code.await_count, 2)
+
+    async def test_lab_authentication_retry_is_limited_to_one_attempt(self):
+        responses = []
+        get_code = AsyncMock(side_effect=[VERIFICATION_CODE, "004218"])
+
+        async def rejected_login(process):
+            responses.extend(await request_both_factors(process))
+            for _ in range(2):
+                await write_prompt(process, "\nPermission denied, please try again.\nPassword:")
+                password = await read_response(process, 0.25)
+                responses.append(password)
+                if not password:
+                    break
+                await write_prompt(process, "\nVerification code:")
+                responses.append(await read_response(process, 2))
+
+        async with gateway("\nLogin failed.\n", 1, after_marker=rejected_login) as connection:
+            with self.assertRaisesRegex(RuntimeError, "lab PC") as caught:
+                await asyncio.wait_for(discover_vnc(connection, PASSWORD, get_code), 5)
+        self.assertEqual(responses, [PASSWORD + "\n", VERIFICATION_CODE + "\n", PASSWORD + "\n", "004218\n", ""])
+        self.assertEqual(get_code.await_count, 2)
+        for secret in (PASSWORD.strip(), VERIFICATION_CODE, "004218"):
+            self.assertNotIn(secret, str(caught.exception))
+
+    async def test_post_verification_password_reply_requires_lab_login_context(self):
+        for notice in (
+            "\nPlease wait for service to begin ...\n",
+            "\nCreate a new VNC connection password.\n",
+        ):
+            with self.subTest(notice=notice):
+                responses = []
+                get_code = AsyncMock(return_value=VERIFICATION_CODE)
+
+                async def additional_prompt(process):
+                    responses.extend(await request_both_factors(process))
+                    await write_prompt(process, notice + "Password:")
+                    responses.append(await read_response(process, 0.25))
+
+                async with gateway("\nStartup stopped.\n", 1, after_marker=additional_prompt) as connection:
+                    with self.assertRaises(RuntimeError):
+                        await asyncio.wait_for(discover_vnc(connection, PASSWORD, get_code), 5)
+                self.assertEqual(responses, [PASSWORD + "\n", VERIFICATION_CODE + "\n", ""])
+                get_code.assert_awaited_once_with()
+
     async def test_verification_prompt_before_department_password_receives_no_code(self):
         responses = []
         get_code = AsyncMock(return_value=VERIFICATION_CODE)
