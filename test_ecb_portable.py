@@ -153,6 +153,32 @@ class PortableCredentialTests(unittest.TestCase):
 
 
 class PortableLifetimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_login_check_disconnects_without_starting_a_remote_desktop_or_viewer(self):
+        session = SimpleNamespace(vault=Mock(), known_hosts=Path("USB/data/known_hosts"))
+        context = AsyncMock()
+
+        def connected_after_unlock(*args, **kwargs):
+            session.vault.unlock.assert_called_once()
+            return context
+
+        with patch("ecb_login.asyncssh.connect", side_effect=connected_after_unlock), \
+                patch("ecb_login.discover_vnc", AsyncMock()) as discover, \
+                patch("ecb_login.open_realvnc", AsyncMock()) as viewer:
+            await ecb_login.connect_vnc("fixture", 5905, portable=session, check_login=True)
+        discover.assert_not_awaited()
+        viewer.assert_not_awaited()
+        context.__aexit__.assert_awaited_once()
+        session.vault.clear.assert_called_once()
+
+    async def test_failed_vault_unlock_does_not_start_ssh_authentication(self):
+        session = SimpleNamespace(vault=Mock(), known_hosts=Path("USB/data/known_hosts"))
+        session.vault.unlock.side_effect = RuntimeError("fixture wrong vault unlock")
+        with patch("ecb_login.asyncssh.connect") as connect:
+            with self.assertRaisesRegex(RuntimeError, "wrong vault unlock"):
+                await ecb_login.connect_vnc("fixture", 5905, portable=session)
+        connect.assert_not_called()
+        session.vault.clear.assert_called_once()
+
     async def test_closing_viewer_closes_the_tunnel_and_clears_the_vault_unlock(self):
         vault = Mock()
         session = SimpleNamespace(vault=vault, known_hosts=Path("USB/data/known_hosts"))

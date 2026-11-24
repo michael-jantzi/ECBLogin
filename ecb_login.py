@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from contextlib import suppress
 from pathlib import Path
 
@@ -449,18 +450,21 @@ async def open_realvnc(local_port, client):
             await process.communicate()
 
 
-async def connect_vnc(username, local_port, password_entry=None, refresh_passwords=False, portable=None):
-    print(f"Connecting to {username}@{GATEWAY} ...", flush=True)
+async def connect_vnc(username, local_port, password_entry=None, refresh_passwords=False, portable=None, check_login=False):
     client = LoginClient(username, password_entry, refresh_passwords, portable)
     try:
-        await _connect_vnc(client, local_port)
+        # Human vault entry must not consume the server's SSH authentication timeout.
+        if portable:
+            portable.vault.unlock()
+        print(f"Connecting to {username}@{GATEWAY} ...", flush=True)
+        await _connect_vnc(client, local_port, check_login)
     finally:
         client.clear_credentials()
         if portable:
             portable.vault.clear()
 
 
-async def _connect_vnc(client, local_port):
+async def _connect_vnc(client, local_port, check_login=False):
     portable = client.portable
     options = {"known_hosts": str(portable.known_hosts), "client_keys": []} if portable else {}
     async with asyncssh.connect(
@@ -474,6 +478,9 @@ async def _connect_vnc(client, local_port):
         keepalive_interval=30,
         **options,
     ) as connection:
+        if check_login:
+            print("Gateway login verified. No desktop was started.", flush=True)
+            return
         print("Running vncconnect in Pascal's login shell ...", flush=True)
         try:
             host, port = await discover_vnc(connection, client.department_password, client.host_verification_code)
@@ -518,6 +525,7 @@ def main():
     parser.add_argument("--portable", action="store_true", help="use USB-local tools, vault, and settings")
     parser.add_argument("--portable-root", type=Path, help="portable folder (defaults to the executable folder)")
     parser.add_argument("--check", action="store_true", help="check portable files without unlocking or connecting")
+    parser.add_argument("--check-login", action="store_true", help="verify SSH authentication without starting a desktop")
     args = parser.parse_args()
     if args.local_port is not None and not 1 <= args.local_port <= 65535:
         parser.error("--local-port must be between 1 and 65535")
@@ -537,7 +545,9 @@ def main():
         password_entry = args.password_entry if args.password_entry is not None else settings.get("password_entry")
         if portable:
             portable.viewer_profile(port)
-        asyncio.run(connect_vnc(username, port, password_entry, args.refresh_passwords, portable))
+        if args.check_login:
+            print("Current computer time: " + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()), flush=True)
+        asyncio.run(connect_vnc(username, port, password_entry, args.refresh_passwords, portable, args.check_login))
     except KeyboardInterrupt:
         print("\nConnection closed.")
     except asyncssh.HostKeyNotVerifiable:

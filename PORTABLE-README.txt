@@ -5,6 +5,8 @@ Unlock otp.kdbx with your existing KeePassXC vault password. When a department
 or VNC password is not yet in the USB vault, enter it once; it is saved in the
 encrypted vault only after that login succeeds. The vault unlock is requested
 once per session and is never saved on the USB or in Windows Credential Manager.
+The vault is unlocked before opening SSH, so typing time does not consume the
+gateway's authentication timeout.
 
 Keep the console open while connected. Close Viewer or press Ctrl+C to end the
 portable session. After the program closes, safely eject the USB stick.
@@ -13,6 +15,11 @@ Before a connection, you can open a terminal in this folder and run:
     .\Connect-ECB.exe --check
 This checks files, SSH trust, and the KeePassXC runtime without unlocking the
 vault or contacting the school. A successful check does not test the login.
+
+To test the actual executable's authentication without starting a desktop:
+    .\Connect-ECB.exe --check-login
+This displays the PC's UTC time, unlocks the USB vault, and checks the gateway
+login. It closes the SSH connection immediately after successful authentication.
 
 Login progress identifies when the department password and verification code
 are sent, without displaying either secret. If Pascal restarts login after
