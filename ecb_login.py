@@ -13,6 +13,7 @@ from pathlib import Path
 import asyncssh
 
 from ecb_credentials import read_password, save_password
+from ecb_portable import PortableSession, application_directory, external_program
 from ecb_viewer_profile import find_viewer_profile
 from vnc_password import deliver_password, encode_vnc_password, password_pipe
 
@@ -45,10 +46,11 @@ def read_secret(prompt):
 
 
 class LoginClient(asyncssh.SSHClient):
-    def __init__(self, username, password_entry, refresh_passwords=False):
+    def __init__(self, username, password_entry, refresh_passwords=False, portable=None):
         self.username = username
         self.password_entry = password_entry
         self.refresh_passwords = refresh_passwords
+        self.portable = portable
         self.pending_passwords = {}
         self.database_password = None
         self.department_password = None
@@ -63,11 +65,14 @@ class LoginClient(asyncssh.SSHClient):
 
     def get_password(self, target, account, prompt):
         if not self.refresh_passwords:
-            try:
-                saved = read_password(target)
-            except RuntimeError as exc:
-                print(f"{exc} Enter the password for this session.", file=sys.stderr)
-                return read_secret(prompt)
+            if self.portable:
+                saved = self.portable.vault.read_password(target)
+            else:
+                try:
+                    saved = read_password(target)
+                except RuntimeError as exc:
+                    print(f"{exc} Enter the password for this session.", file=sys.stderr)
+                    return read_secret(prompt)
             if saved is not None:
                 return saved
         password = read_secret(prompt)
@@ -75,6 +80,8 @@ class LoginClient(asyncssh.SSHClient):
         return password
 
     def read_entry(self, entry, *options):
+        if self.portable:
+            return self.portable.vault.read_entry(entry, *options)
         cli = Path(os.environ["ProgramFiles"]) / "KeePassXC" / "keepassxc-cli.exe"
         database = Path(os.environ["LOCALAPPDATA"]) / "ECB" / "otp.kdbx"
         if not cli.is_file():
@@ -167,7 +174,10 @@ class LoginClient(asyncssh.SSHClient):
     def save_pending_passwords(self):
         for target, (account, password) in self.pending_passwords.items():
             try:
-                save_password(target, account, password)
+                if self.portable:
+                    self.portable.vault.save_password(target, account, password)
+                else:
+                    save_password(target, account, password)
             except RuntimeError as exc:
                 print(f"{exc} This password could not be saved for the next login.", file=sys.stderr)
         self.pending_passwords.clear()
@@ -333,7 +343,8 @@ async def viewer_accepted_password(process):
 async def open_realvnc(local_port, client):
     # Match the saved ECB address exactly. For custom ports, :: forces a TCP port even below 100.
     address = f"{LOOPBACK}:{local_port}" if local_port == DEFAULT_LOCAL_PORT else f"{LOOPBACK}::{local_port}"
-    viewer = Path(os.environ["ProgramFiles"]) / "RealVNC" / "VNC Viewer" / "vncviewer.exe"
+    portable = client.portable
+    viewer = portable.viewer if portable else Path(os.environ["ProgramFiles"]) / "RealVNC" / "VNC Viewer" / "vncviewer.exe"
     target = client.account_target("VNC")
     process = None
     try:
@@ -343,7 +354,7 @@ async def open_realvnc(local_port, client):
             encoded = encode_vnc_password(client.get_password(
                 target, client.username, f"VNC desktop password for {client.username}: ",
             ))
-            profile = find_viewer_profile(local_port)
+            profile = portable.viewer_profile(local_port) if portable else find_viewer_profile(local_port)
             with password_pipe() as (path, pipe):
                 args = [
                     viewer, "-UseAddressBook=0", "-LogToAddressBook=0", "-Log=CConnection:stderr:10",
@@ -351,9 +362,10 @@ async def open_realvnc(local_port, client):
                 ]
                 if profile is not None:
                     args.extend(["-config", profile])
-                process = await asyncio.create_subprocess_exec(
-                    *args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                )
+                with external_program():
+                    process = await asyncio.create_subprocess_exec(
+                        *args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    )
                 await deliver_password(pipe, encoded, process.pid)
             del encoded
             try:
@@ -364,14 +376,25 @@ async def open_realvnc(local_port, client):
                 client.save_pending_passwords()
             else:
                 print(
-                    r"VNC login was not confirmed. To replace a saved password, run .\Connect-ECB.ps1 -RefreshPasswords.",
+                    ("VNC login was not confirmed. Run Connect-ECB.exe --refresh-passwords to replace the USB password."
+                     if portable else r"VNC login was not confirmed. To replace a saved password, run .\Connect-ECB.ps1 -RefreshPasswords."),
                     file=sys.stderr,
                 )
         except (OSError, RuntimeError, ValueError, EOFError) as exc:
             print(f"Automatic VNC login unavailable ({exc}). Enter the password in RealVNC Viewer.", file=sys.stderr)
             if process is None:
                 try:
-                    os.startfile(viewer, arguments=f"-useaddressbook {address}")
+                    if portable:
+                        args = [viewer, "-UseAddressBook=0", "-LogToAddressBook=0", "-Log=CConnection:stderr:10", address]
+                        profile = portable.viewer_profile(local_port)
+                        if profile is not None:
+                            args.extend(["-config", profile])
+                        with external_program():
+                            process = await asyncio.create_subprocess_exec(
+                                *args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                            )
+                    else:
+                        os.startfile(viewer, arguments=f"-useaddressbook {address}")
                 except OSError as launch_error:
                     print(f"Could not open RealVNC Viewer ({launch_error}). Enter {address} in your viewer.", file=sys.stderr)
         finally:
@@ -389,18 +412,30 @@ async def open_realvnc(local_port, client):
             await process.communicate()
 
 
-async def connect_vnc(username, local_port, password_entry=None, refresh_passwords=False):
+async def connect_vnc(username, local_port, password_entry=None, refresh_passwords=False, portable=None):
     print(f"Connecting to {username}@{GATEWAY} ...", flush=True)
-    client = LoginClient(username, password_entry, refresh_passwords)
+    client = LoginClient(username, password_entry, refresh_passwords, portable)
+    try:
+        await _connect_vnc(client, local_port)
+    finally:
+        client.clear_credentials()
+        if portable:
+            portable.vault.clear()
+
+
+async def _connect_vnc(client, local_port):
+    portable = client.portable
+    options = {"known_hosts": str(portable.known_hosts), "client_keys": []} if portable else {}
     async with asyncssh.connect(
         GATEWAY,
-        username=username,
+        username=client.username,
         client_factory=lambda: client,
         config=None,
         preferred_auth=("keyboard-interactive", "password"),
         agent_path=None,
         compression_algs=("zlib@openssh.com", "none"),
         keepalive_interval=30,
+        **options,
     ) as connection:
         print("Running vncconnect in Pascal's login shell ...", flush=True)
         try:
@@ -416,41 +451,77 @@ async def connect_vnc(username, local_port, password_entry=None, refresh_passwor
             print(f"VNC tunnel ready: {LOOPBACK}:{local_port} -> {host}:{port}", flush=True)
             print("Keep this window open while using VNC. Press Ctrl+C to close the tunnel.", flush=True)
             viewer_task = asyncio.create_task(open_realvnc(local_port, client))
+            connection_task = None
             try:
-                await connection.wait_closed()
+                if portable:
+                    connection_task = asyncio.create_task(connection.wait_closed())
+                    done, _ = await asyncio.wait((viewer_task, connection_task), return_when=asyncio.FIRST_COMPLETED)
+                    if viewer_task in done:
+                        await viewer_task
+                        return
+                else:
+                    await connection.wait_closed()
             finally:
                 viewer_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await viewer_task
+                if connection_task is not None:
+                    connection_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await connection_task
             raise RuntimeError("The SSH connection closed. Run Connect-ECB again to reconnect.")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--username", default="mtjantzi")
-    parser.add_argument("--local-port", type=int, default=DEFAULT_LOCAL_PORT)
+    parser.add_argument("--username")
+    parser.add_argument("--local-port", type=int)
     parser.add_argument("--password-entry", help="KeePassXC entry containing the department password")
     parser.add_argument("--refresh-passwords", action="store_true", help="replace remembered passwords after login")
+    parser.add_argument("--portable", action="store_true", help="use USB-local tools, vault, and settings")
+    parser.add_argument("--portable-root", type=Path, help="portable folder (defaults to the executable folder)")
+    parser.add_argument("--check", action="store_true", help="check portable files without unlocking or connecting")
     args = parser.parse_args()
-    if not 1 <= args.local_port <= 65535:
+    if args.local_port is not None and not 1 <= args.local_port <= 65535:
         parser.error("--local-port must be between 1 and 65535")
+    portable = None
     try:
-        asyncio.run(connect_vnc(args.username, args.local_port, args.password_entry, args.refresh_passwords))
+        if args.portable or args.portable_root is not None or getattr(sys, "frozen", False):
+            portable = PortableSession(args.portable_root or application_directory(), read_secret)
+            portable.validate(GATEWAY)
+            if args.check:
+                portable.check(GATEWAY)
+                return
+        elif args.check:
+            parser.error("--check requires --portable or --portable-root")
+        settings = portable.settings if portable else {}
+        username = args.username if args.username is not None else settings.get("username", "mtjantzi")
+        port = args.local_port if args.local_port is not None else settings.get("local_port", DEFAULT_LOCAL_PORT)
+        password_entry = args.password_entry if args.password_entry is not None else settings.get("password_entry")
+        if portable:
+            portable.viewer_profile(port)
+        asyncio.run(connect_vnc(username, port, password_entry, args.refresh_passwords, portable))
     except KeyboardInterrupt:
         print("\nConnection closed.")
     except asyncssh.HostKeyNotVerifiable:
+        if portable:
+            sys.exit(f"Could not verify the SSH key for {GATEWAY}. Verify the fingerprint with the department and update data/known_hosts.")
         sys.exit(
             f"Could not verify the SSH host key for {GATEWAY}. Verify its fingerprint with the department, "
-            f"then check the saved key using ssh {args.username}@{GATEWAY}."
+            f"then check the saved key using ssh {username}@{GATEWAY}."
         )
     except asyncssh.PermissionDenied as exc:
-        if args.password_entry:
+        if args.password_entry or (portable and portable.settings["password_entry"]):
             hint = "Check the department password in your KeePassXC entry."
         else:
-            hint = r"If your department password changed, run .\Connect-ECB.ps1 -RefreshPasswords."
+            hint = ("If your department password changed, run Connect-ECB.exe --refresh-passwords."
+                    if portable else r"If your department password changed, run .\Connect-ECB.ps1 -RefreshPasswords.")
         sys.exit(f"Login failed: {exc}\n{hint}")
     except (asyncssh.Error, OSError, ValueError, RuntimeError, EOFError) as exc:
         sys.exit(f"Connection failed: {exc}")
+    finally:
+        if portable:
+            portable.vault.clear()
 
 
 if __name__ == "__main__":
