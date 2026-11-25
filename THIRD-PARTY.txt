@@ -1,0 +1,19 @@
+This personal portable package includes third-party software under its original
+terms. Packaged binaries and personal data are excluded from the Git repository.
+This file is a component reference, not permission to redistribute vendor files.
+
+Python: https://www.python.org/psf/license/
+AsyncSSH: https://github.com/ronf/asyncssh (EPL-2.0 OR GPL-2.0-or-later)
+Cryptography: https://github.com/pyca/cryptography (Apache-2.0 OR BSD-3-Clause)
+pywin32: https://github.com/mhammond/pywin32 (PSF-2.0)
+PyInstaller: https://pyinstaller.org/en/stable/license.html
+KeePassXC and bundled libraries: https://keepassxc.org/docs/#faq-license
+RealVNC Viewer: https://www.realvnc.com/en/legal/
+Microsoft C++ runtimes: https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files
+
+Use an authorized RealVNC Viewer binary compatible with your school's server.
+The personal builder copies your existing Viewer; it does not change the viewer
+version, activate a license, or install software on the destination PC. Native
+Microsoft C++ runtime DLLs are copied from --runtime-dir for app-local use.
+Release distributors must supply all required notices and distribution rights.
+manifest.json records the bundled dependency versions and binary checksums.
